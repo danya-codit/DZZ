@@ -1,0 +1,270 @@
+import os
+import zipfile
+import io
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from sklearn.cluster import KMeans
+from google.colab import drive
+def show_first_10_images(zip_path):
+    """
+    Показывает первые 10 изображений из ZIP-архива (поддерживает JPG, PNG, TIFF)
+    :param zip_path: путь к ZIP-архиву с изображениями
+    """
+    try:
+        # Проверяем существование файла
+        if not os.path.exists(zip_path):
+            print(f"Ошибка: файл {zip_path} не найден!")
+            return
+
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            # Получаем список изображений в архиве (добавлен TIFF)
+            image_files = [f for f in zip_ref.namelist()
+                         if f.lower().endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff'))]
+
+            if not image_files:
+                print("В архиве не найдено изображений!")
+                return
+
+            print(f"Найдено {len(image_files)} изображений. Показываю первые 10:")
+
+            # Создаем фигуру для отображения
+            plt.figure(figsize=(20, 12))  # Увеличил размер для удобства просмотра
+
+            for i, img_name in enumerate(image_files[:10]):
+                try:
+                    with zip_ref.open(img_name) as img_file:
+                        img = Image.open(io.BytesIO(img_file.read()))
+
+                        # Конвертируем TIFF в RGB для корректного отображения
+                        if img_name.lower().endswith(('.tif', '.tiff')):
+                            if img.mode == 'I;16':
+                                img = img.point(lambda p: p * (1. / 256)).convert('L')
+                            elif img.mode not in ('RGB', 'L'):
+                                img = img.convert('RGB')
+
+                        # Выводим изображение
+                        plt.subplot(2, 5, i+1)
+                        plt.imshow(img, cmap='gray' if img.mode == 'L' else None)
+                        plt.title(os.path.basename(img_name))
+                        plt.axis('off')
+
+                except Exception as img_error:
+                    print(f"Ошибка при чтении {img_name}: {str(img_error)}")
+
+            plt.tight_layout()
+            plt.show()
+
+    except Exception as main_error:
+        print(f"Ошибка при работе с архивом: {str(main_error)}")
+
+# Пример использования
+archive_path = '/content/drive/MyDrive/Цифровая кафедра/Классификация/OutputFotos100.zip'
+show_first_10_images(archive_path)
+# Подключение Google Drive
+drive.mount('/content/drive')
+
+# Путь к архиву (запросим у пользователя)
+archive_path = '/content/drive/MyDrive/Цифровая кафедра/Классификация/OutputFotos100.zip'
+
+# Количество классов (кластеров)
+num_classes = int(input("Введите количество классов для классификации: ").strip())
+
+# Создаем папку Classification
+output_dir = os.path.join(os.path.dirname(archive_path), 'Classification')
+os.makedirs(output_dir, exist_ok=True)
+
+# Создаем подпапки для каждого класса
+for i in range(num_classes):
+    os.makedirs(os.path.join(output_dir, f'class_{i}'), exist_ok=True)
+# Модель для извлечения признаков
+class FeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = models.resnet18(pretrained=True)
+        self.model = nn.Sequential(*list(self.model.children())[:-1])  # Удаляем последний слой
+
+    def forward(self, x):
+        return self.model(x).squeeze()
+
+# Функция для загрузки и конвертации TIFF
+def load_tiff_image(img_data):
+    img = Image.open(io.BytesIO(img_data))
+    if img.mode == 'I;16':
+        img = img.point(lambda p: p * (1./256)).convert('L')
+    elif img.mode not in ('RGB', 'L'):
+        img = img.convert('RGB')
+    return img
+
+# Трансформации изображений
+transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# Извлекаем признаки из всех изображений (с поддержкой TIFF)
+def extract_features(zip_path):
+    model = FeatureExtractor().eval().to('cuda' if torch.cuda.is_available() else 'cpu')
+    features = []
+    filenames = []
+
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        # Добавляем поддержку TIFF
+        image_files = [f for f in zf.namelist() if f.lower().endswith(('jpg', 'jpeg', 'png', 'tif', 'tiff'))]
+
+        for file in tqdm(image_files, desc="Извлечение признаков"):
+            try:
+                with zf.open(file) as img_file:
+                    img_data = img_file.read()
+
+                    # Обработка TIFF
+                    if file.lower().endswith(('tif', 'tiff')):
+                        img = load_tiff_image(img_data)
+                    else:
+                        img = Image.open(io.BytesIO(img_data)).convert('RGB')
+
+                    img_tensor = transform(img).unsqueeze(0).to('cuda' if torch.cuda.is_available() else 'cpu')
+
+                    with torch.no_grad():
+                        feature = model(img_tensor).cpu().numpy().flatten()
+
+                    features.append(feature)
+                    filenames.append(file)
+            except Exception as e:
+                print(f"Ошибка при обработке {file}: {e}")
+
+    return np.array(features), filenames
+
+# Кластеризация с помощью K-Means
+def cluster_images(features, filenames, n_clusters):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    clusters = kmeans.fit_predict(features)
+    return clusters
+
+# Копируем изображения в соответствующие папки
+def copy_to_classes(zip_path, filenames, clusters, output_dir):
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        for filename, cluster in tqdm(zip(filenames, clusters), desc="Сортировка изображений"):
+            try:
+                with zf.open(filename) as img_file:
+                    img_data = img_file.read()
+
+                    output_path = os.path.join(output_dir, f'class_{cluster}', os.path.basename(filename))
+
+                    with open(output_path, 'wb') as f:
+                        f.write(img_data)
+            except Exception as e:
+                print(f"Ошибка при копировании {filename}: {e}")
+# Основной процесс
+print("\nНачало обработки...")
+features, filenames = extract_features(archive_path)
+print("\nКластеризация изображений...")
+clusters = cluster_images(features, filenames, num_classes)
+print("\nСохранение результатов...")
+copy_to_classes(archive_path, filenames, clusters, output_dir)
+
+print(f"\nГотово! Изображения отсортированы по {num_classes} классам в папке: {output_dir}")
+def count_images_per_class(output_dir):
+    """
+    Подсчитывает количество изображений в каждой классовой папке
+    :param output_dir: путь к папке с результатами классификации
+    :return: словарь с количеством изображений по классам
+    """
+    class_counts = {}
+
+    # Проверяем существование папки с результатами
+    if not os.path.exists(output_dir):
+        print(f"Ошибка: папка {output_dir} не найдена!")
+        return None
+
+    # Получаем список классов (подпапок)
+    classes = [d for d in os.listdir(output_dir)
+              if os.path.isdir(os.path.join(output_dir, d)) and d.startswith('class_')]
+
+    if not classes:
+        print("Не найдено ни одного класса для анализа!")
+        return None
+
+    print("\nКоличество изображений по классам:")
+    print("-" * 30)
+
+    for class_dir in sorted(classes):
+        class_path = os.path.join(output_dir, class_dir)
+        # Считаем только файлы изображений
+        images = [f for f in os.listdir(class_path)
+                 if f.lower().endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff'))]
+        count = len(images)
+        class_counts[class_dir] = count
+        print(f"{class_dir}: {count} изображений")
+
+    print("-" * 30)
+    total = sum(class_counts.values())
+    print(f"Всего изображений: {total}")
+
+    return class_counts
+
+# Пример использования после классификации
+class_stats = count_images_per_class(output_dir)
+import os
+from google.colab import drive
+
+def print_directory_tree(start_path, indent=''):
+    """
+    Рекурсивно выводит дерево каталогов и файлов, начиная с start_path.
+
+    Args:
+        start_path (str): Путь к начальной папке
+        indent (str): Отступ для визуального оформления (используется рекурсивно)
+    """
+    # Проверяем, существует ли путь
+    if not os.path.exists(start_path):
+        print(f"Путь не существует: {start_path}")
+        return
+
+    # Получаем список элементов в папке
+    try:
+        items = os.listdir(start_path)
+    except PermissionError:
+        print(f"{indent}[Нет доступа к папке] {os.path.basename(start_path)}/")
+        return
+
+    # Разделяем файлы и папки
+    files = []
+    dirs = []
+    for item in items:
+        item_path = os.path.join(start_path, item)
+        if os.path.isfile(item_path):
+            files.append(item)
+        else:
+            dirs.append(item)
+
+    # Выводим информацию о текущей папке
+    print(f"{indent}📁 {os.path.basename(start_path)}/")
+
+    # Выводим файлы
+    if files:
+        print(f"{indent}│   🗄️ Файлов: {len(files)}")
+        # Если нужно выводить имена файлов, раскомментируйте:
+        # for file in files:
+        #     print(f"{indent}│   ├─ {file}")
+
+    # Выводим подпапки и рекурсивно их обрабатываем
+    for directory in dirs:
+        dir_path = os.path.join(start_path, directory)
+        print_directory_tree(dir_path, indent + "│   ")
+
+# Монтируем Google Drive (если ещё не смонтирован)
+if not os.path.exists('/content/drive'):
+    drive.mount('/content/drive')
+
+# Путь к вашей папке
+target_path = '/content/drive/MyDrive/Цифровая кафедра/Классификация/Classification'
+
+# Запускаем анализ
+print("🌳 Дерево каталогов:")
+print_directory_tree(target_path)
