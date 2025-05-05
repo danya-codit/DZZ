@@ -23,7 +23,7 @@ drive.mount('/content/drive')
 
 # Конфигурация путей (измените под ваш случай)
 zip_path = '/content/drive/MyDrive/Цифровая кафедра/Обучение с полями/Полный архив.zip'
-extract_path = '/content/dataset'
+extract_path = '/content/drive/MyDrive/Цифровая кафедра/Обучение с полями'
 os.makedirs(extract_path, exist_ok=True)
 
 # Распаковка архива
