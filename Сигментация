@@ -200,40 +200,61 @@ class SatelliteDataset(Dataset):
             dummy_img = torch.zeros(3, 100, 100)
             dummy_mask = torch.zeros(3, 100, 100)
             return dummy_img, dummy_mask
-# 8. Надежная функция визуализации без аугментаций
-def show_samples(dataset, title):
+# 8. Улучшенная функция визуализации со случайной выборкой
+def show_samples(dataset, title, num_samples=3, random_seed=None):
+    """
+    Визуализирует случайные примеры из датасета
+    
+    Параметры:
+        dataset: Датасет для визуализации
+        title: Заголовок для отображения
+        num_samples: Количество примеров (по умолчанию 3)
+        random_seed: Фиксированный seed для воспроизводимости (None для случайных)
+    """
     plt.figure(figsize=(10, 5))
     
-    # Создаем временный датасет без аугментаций для визуализации
+    # Создаем временный датасет без аугментаций
     from copy import deepcopy
     vis_dataset = deepcopy(dataset)
     vis_dataset.transform = None  # Отключаем аугментации
     
-    num_samples = min(3, len(vis_dataset))
+    # Проверяем доступное количество примеров
+    num_samples = min(num_samples, len(vis_dataset))
+    if num_samples <= 0:
+        print("⚠️ Нет доступных примеров для визуализации")
+        return
     
-    for i in range(num_samples):
+    # Выбираем случайные индексы
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    random_indices = np.random.choice(len(vis_dataset), num_samples, replace=False)
+    
+    for i, idx in enumerate(random_indices):
         try:
-            img, mask = vis_dataset[i]
+            img, mask = vis_dataset[idx]
             
+            # Визуализация изображения
             plt.subplot(2, num_samples, i+1)
             plt.imshow(img.permute(1, 2, 0))
-            plt.title(f"{title} {i+1}")
+            plt.title(f"{title} {i+1}\n{os.path.basename(dataset.samples[idx][0])}")
             plt.axis('off')
             
+            # Визуализация маски
             plt.subplot(2, num_samples, i+1+num_samples)
             plt.imshow(mask.permute(1, 2, 0))
             plt.title(f"Маска {i+1}")
             plt.axis('off')
             
         except Exception as e:
-            print(f"Ошибка визуализации примера {i}: {str(e)}")
+            print(f"Ошибка визуализации примера {idx}: {str(e)}")
             continue
     
     plt.tight_layout()
     plt.show()
-# Визуализация примеров (добавьте эти строки)
-print("\nПримеры из обучающей выборки:")
-show_samples(train_dataset, "Train")
+    plt.close()  # Закрываем фигуру чтобы не накапливались в памяти
 
-print("\nПримеры из валидационной выборки:")
-show_samples(val_dataset, "Validation")
+kol=5
+print("\n5 случайных примеров:")
+show_samples(train_dataset, "Train", num_samples=kol)
+print("\n5 случайных примеров:")
+show_samples(val_dataset, "Validation", num_samples=kol)
