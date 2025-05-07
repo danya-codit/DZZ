@@ -8,31 +8,25 @@ from PIL import Image
 import json
 import matplotlib.pyplot as plt
 from sklearn.utils.class_weight import compute_class_weight
-from google.colab import drive
-import segmentation_models_pytorch as smp
-import matplotlib.patches as mpatches
 from pycocotools import mask as maskUtils
+import os
 
-# 1. Монтируем Google Drive
-drive.mount('/content/drive')
-
-# 2. Конфигурация
-IMAGE_PATH = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/supervisely/full_area_01.png'
-ANNOTATION_PATH = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/supervisely/instances.json'
-CLASSES = ['background', 'city', 'field', 'forest', 'water']
+# 1. Конфигурация
+CLASSES = ['background', 'city', 'field', 'forest', 'water']  # Фон должен быть первым
 CLASS_COLORS = {
-    'city': [255, 0, 0],    # Красный
-    'field': [255, 255, 0], # Жёлтый
-    'forest': [0, 255, 0],  # Зелёный
-    'water': [0, 0, 255]    # Синий
+    0: [0, 0, 0],        # background - черный
+    1: [255, 0, 0],      # city - красный
+    2: [255, 255, 0],    # field - желтый
+    3: [0, 255, 0],      # forest - зеленый
+    4: [0, 0, 255]       # water - синий
 }
 NUM_CLASSES = len(CLASSES)
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# 3. Датасет
+# 2. Исправленный класс Dataset
 class SatelliteDataset(Dataset):
     def __init__(self, image_path, annotation_path, transform=None):
-        self.image = np.array(Image.open(image_path))
+        self.image = np.array(Image.open(image_path).convert('RGB'))
         with open(annotation_path) as f:
             self.coco_data = json.load(f)
         self.transform = transform
@@ -40,55 +34,54 @@ class SatelliteDataset(Dataset):
         
     def _load_masks(self):
         h, w = self.image.shape[:2]
-        masks = np.zeros((h, w), dtype=np.uint8)
+        mask = np.zeros((h, w), dtype=np.uint8)
         
         for ann in self.coco_data['annotations']:
-            mask = self._decode_coco_mask(ann['segmentation'], h, w)
-            masks[mask > 0] = ann['category_id']
+            if isinstance(ann['segmentation'], list):
+                # Полигональная аннотация
+                if len(ann['segmentation']) > 0:
+                    rle = maskUtils.frPyObjects(ann['segmentation'], h, w)
+                    m = maskUtils.decode(rle)
+                    if m.ndim == 3:
+                        m = m.sum(axis=2) > 0
+            elif isinstance(ann['segmentation'], dict):
+                # RLE аннотация
+                m = maskUtils.decode(ann['segmentation'])
+            else:
+                continue
+                
+            mask[m > 0] = ann['category_id']
             
-        return masks
-    
-    def _decode_coco_mask(self, segmentation, h, w):
-        rle = {'counts': segmentation[0]['counts'], 'size': [h, w]}
-        return maskUtils.decode(rle)
+        return mask
     
     def __len__(self):
-        return 100  # 100 аугментированных вариантов
+        return 100  # Генерируем 100 аугментированных вариантов
     
     def __getitem__(self, idx):
-        transformed = self.transform(
-            image=self.image, 
-            mask=self.masks
-        )
-        return transformed['image'], transformed['mask']
+        if self.transform:
+            transformed = self.transform(image=self.image, mask=self.masks)
+            return transformed['image'], transformed['mask']
+        return self.image, self.masks
 
-# 4. Аугментации
+# 3. Аугментации
 def get_transform():
     return A.Compose([
         A.RandomCrop(512, 512),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
-        A.RandomBrightnessContrast(p=0.3),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
 
-# 5. Модель
-class SegModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = smp.Unet(
-            'resnet50',
-            encoder_weights='imagenet',
-            classes=NUM_CLASSES,
-            activation='softmax'
-        )
-        
-    def forward(self, x):
-        return self.model(x)
+# 4. Функция для вычисления весов классов
+def get_class_weights(mask):
+    classes = np.unique(mask)
+    weights = compute_class_weight('balanced', classes=classes, y=mask.flatten())
+    weight_dict = {cls: weight for cls, weight in zip(classes, weights)}
+    return torch.tensor([weight_dict.get(i, 1.0) for i in range(NUM_CLASSES)]).float().to(DEVICE)
 
-# 6. Обучение с визуализацией
+# 5. Обучение с исправлениями
 def train():
     dataset = SatelliteDataset(IMAGE_PATH, ANNOTATION_PATH, get_transform())
     loader = DataLoader(dataset, batch_size=4, shuffle=True)
@@ -96,15 +89,10 @@ def train():
     model = SegModel().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
-    # Веса классов
-    _, full_mask = dataset[0]
-    class_weights = torch.tensor(
-        compute_class_weight('balanced', classes=np.unique(full_mask), y=full_mask.flatten()),
-        dtype=torch.float
-    ).to(DEVICE)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # Веса классов с обработкой отсутствующих классов
+    weights = get_class_weights(dataset.masks)
+    criterion = nn.CrossEntropyLoss(weight=weights)
     
-    # Для графиков
     train_loss = []
     train_iou = []
     
@@ -132,7 +120,7 @@ def train():
         
         print(f'Epoch {epoch+1}, Loss: {epoch_loss:.4f}, IoU: {epoch_iou:.4f}')
     
-    # Графики
+    # Визуализация
     plt.figure(figsize=(12, 5))
     plt.subplot(1, 2, 1)
     plt.plot(train_loss, label='Loss')
@@ -154,75 +142,9 @@ def train():
 def calculate_iou(preds, targets):
     smooth = 1e-6
     preds = torch.argmax(preds, dim=1)
-    intersection = (preds & targets).float().sum()
+    intersection = (preds == targets).float().sum()
     union = (preds | targets).float().sum()
     return (intersection + smooth) / (union + smooth)
 
-# 7. Предсказание с цветными масками
-def predict_and_visualize(model, image_path):
-    model.eval()
-    image = np.array(Image.open(image_path))
-    h, w = image.shape[:2]
-    
-    transform = A.Compose([
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2()
-    ])
-    
-    # Разбиваем на тайлы
-    tile_size = 512
-    full_mask = np.zeros((h, w), dtype=np.uint8)
-    
-    for y in range(0, h, tile_size):
-        for x in range(0, w, tile_size):
-            tile = image[y:y+tile_size, x:x+tile_size]
-            if tile.size == 0:
-                continue
-                
-            transformed = transform(image=tile)
-            tile_tensor = transformed['image'].unsqueeze(0).to(DEVICE)
-            
-            with torch.no_grad():
-                output = model(tile_tensor)
-                pred = torch.argmax(output, dim=1).cpu().numpy()[0]
-            
-            full_mask[y:y+tile.shape[0], x:x+tile.shape[1]] = pred
-    
-    # Создаем цветную маску
-    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
-    for class_id, class_name in enumerate(CLASSES[1:], 1):
-        color_mask[full_mask == class_id] = CLASS_COLORS[class_name]
-    
-    # Визуализация
-    plt.figure(figsize=(18, 6))
-    
-    plt.subplot(1, 3, 1)
-    plt.imshow(image)
-    plt.title('Original Image')
-    plt.axis('off')
-    
-    plt.subplot(1, 3, 2)
-    plt.imshow(color_mask)
-    plt.title('Predicted Mask')
-    plt.axis('off')
-    
-    plt.subplot(1, 3, 3)
-    plt.imshow(image)
-    plt.imshow(color_mask, alpha=0.5)
-    plt.title('Overlay')
-    plt.axis('off')
-    
-    # Легенда
-    patches = [mpatches.Patch(color=np.array(CLASS_COLORS[cls])/255, label=cls) 
-               for cls in CLASSES[1:]]
-    plt.legend(handles=patches, bbox_to_anchor=(1.05, 1), loc='upper left')
-    
-    plt.tight_layout()
-    plt.show()
-
 # Запуск
 model = train()
-
-# Тестирование на новом изображении
-TEST_IMAGE = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/supervisely/full_area_02.png'
-predict_and_visualize(model, TEST_IMAGE)
