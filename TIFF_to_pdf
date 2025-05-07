@@ -1,0 +1,31 @@
+from PIL import Image
+import os
+
+# Имя исходного файла (должен находиться в той же папке что и ноутбук)
+#input_filename = "imageToDrive_small_badpic.tif"
+#input_filename = "imageToDrive_small_norm_pic.tif"
+input_filename = "full_area.tif"
+
+output_filename = os.path.splitext(input_filename)[0] + ".png"
+
+try:
+    # Открываем TIFF файл
+    with Image.open(input_filename) as img:
+        # Конвертируем и сохраняем как PNG
+        img.save(output_filename, "PNG")
+        print(f"Файл успешно конвертирован: {input_filename} -> {output_filename}")
+        
+        # Показываем информацию о файле
+        print(f"\nИнформация о изображении:")
+        print(f"Формат: {img.format}")
+        print(f"Размер: {img.size}")
+        print(f"Режим: {img.mode}")
+        
+except FileNotFoundError:
+    print(f"Ошибка: файл '{input_filename}' не найден в текущей директории.")
+except Exception as e:
+    print(f"Произошла ошибка при конвертации: {str(e)}")
+
+# Показываем содержимое папки для проверки
+print("\nСодержимое текущей папки:")
+!ls -lh
