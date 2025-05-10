@@ -1,454 +1,263 @@
-import os
-import cv2
-import numpy as np
-from PIL import Image
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-import albumentations as A
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-import torch.optim as optim
-from torchvision import transforms
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import numpy as np
+from PIL import Image
+import json
+import matplotlib.pyplot as plt
+from sklearn.utils.class_weight import compute_class_weight
+from pycocotools import mask as maskUtils
+import os
 import segmentation_models_pytorch as smp
-from tqdm import tqdm
-
-# 1. Подключение Google Drive
 from google.colab import drive
-drive.mount('/content/drive', force_remount=True)
+from tqdm.notebook import tqdm
+import matplotlib.patches as mpatches
 
-# 2. Конфигурация путей
-DATA_ROOT = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/Полный архив'
-CLASSES = {
-    'Лес': [0, 255, 0],    # Зеленый
-    'Поле': [255, 255, 0], # Желтый
-    'Город': [255, 0, 0],  # Красный
-    'Вода': [0, 0, 255]    # Синий
+
+# 1. Монтирование Google Drive и настройка путей
+drive.mount('/content/drive')
+IMAGE_PATH = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/supervisely/full_area_01.png'
+ANNOTATION_PATH = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/supervisely/instances.json'
+SAVE_DIR = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/supervisely/models/'
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# 2. Конфигурация классов и цветов
+CLASSES = ['background', 'city', 'field', 'forest', 'water']
+CLASS_COLORS = {
+    1: [255, 0, 0],    # Красный - город
+    2: [255, 255, 0],  # Желтый - поле
+    3: [0, 255, 0],    # Зеленый - лес
+    4: [0, 0, 255]     # Синий - вода
 }
+NUM_CLASSES = len(CLASSES)
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-# 3. Проверка структуры данных
-print("Содержимое рабочей папки:")
-!ls -la "{DATA_ROOT}"
-
-print("\nКоличество файлов в каждой папке:")
-for class_name in CLASSES.keys():
-    class_path = os.path.join(DATA_ROOT, class_name)
-    if os.path.exists(class_path):
-        count = len(os.listdir(class_path))
-        print(f"{class_name}: {count} файлов")
-    else:
-        print(f"⚠️ Папка {class_name} не найдена")
-
-# 4. Функция для чтения изображений с обработкой ошибок
-def read_image(path):
-    try:
-        # Пробуем прочитать как TIFF
-        if path.lower().endswith(('.tif', '.tiff')):
-            try:
-                return tifffile.imread(path)
-            except:
-                return np.array(Image.open(path))
-        else:
-            return np.array(Image.open(path))
-    except Exception as e:
-        print(f"Ошибка чтения {path}: {str(e)}")
-        return None
-
-# 5. Класс Dataset для работы напрямую с исходными файлами
+# 3. Класс Dataset
 class SatelliteDataset(Dataset):
-    def __init__(self, root_dir, classes, transform=None, mode='train'):
-        self.samples = []
+    def __init__(self, image_path, annotation_path, transform=None):
+        self.image = np.array(Image.open(image_path).convert('RGB'))
+        with open(annotation_path) as f:
+            self.coco_data = json.load(f)
         self.transform = transform
-
-        for class_name, color in classes.items():
-            class_dir = os.path.join(root_dir, class_name)
-            if not os.path.exists(class_dir):
+        self.masks = self._load_masks()
+        
+    def _load_masks(self):
+        h, w = self.image.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        
+        for ann in self.coco_data['annotations']:
+            if isinstance(ann['segmentation'], list):
+                if len(ann['segmentation']) > 0:
+                    rle = maskUtils.frPyObjects(ann['segmentation'], h, w)
+                    m = maskUtils.decode(rle)
+                    if m.ndim == 3:
+                        m = np.sum(m, axis=2) > 0
+            elif isinstance(ann['segmentation'], dict):
+                m = maskUtils.decode(ann['segmentation'])
+            else:
                 continue
-
-            files = [f for f in os.listdir(class_dir) if f.lower().endswith(('.tif', '.tiff', '.png', '.jpg', '.jpeg'))]
-            train_files, val_files = train_test_split(files, test_size=0.2, random_state=42)
-
-            for f in (train_files if mode == 'train' else val_files):
-                self.samples.append((
-                    os.path.join(class_dir, f),
-                    color
-                ))
-
-        if not self.samples:
-            raise ValueError(f"Не найдено изображений для {mode}")
-
+                
+            mask[m > 0] = ann['category_id']
+            
+        return mask
+    
     def __len__(self):
-        return len(self.samples)
-
+        return 100  # 100 аугментированных вариантов
+    
     def __getitem__(self, idx):
-        img_path, color = self.samples[idx]
-
-        img = read_image(img_path)
-        if img is None:
-            return self.__getitem__((idx + 1) % len(self))
-
-        # Нормализация
-        if img.dtype == np.uint16:
-            img = (img / 256).astype(np.uint8)
-        if len(img.shape) == 2:
-            img = np.stack([img]*3, axis=-1)
-        img = img[:,:,:3]
-
-        # Создание маски
-        mask = np.zeros_like(img)
-        mask[:] = color
-
         if self.transform:
-            augmented = self.transform(image=img, mask=mask)
-            img, mask = augmented['image'], augmented['mask']
+            transformed = self.transform(image=self.image, mask=self.masks)
+            return transformed['image'], transformed['mask']
+        return self.image, self.masks
 
-        return transforms.ToTensor()(img), transforms.ToTensor()(mask)
+# 4. Аугментации
+def get_transform():
+    return A.Compose([
+        A.RandomCrop(512, 512),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.RandomBrightnessContrast(p=0.2),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2()
+    ])
 
-# 6. Безопасные аугментации для изображений 100x100
-train_transform = A.Compose([
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.RandomRotate90(p=0.5),
-    A.RandomBrightnessContrast(
-        brightness_limit=0.1, 
-        contrast_limit=0.1, 
-        p=0.5
-    ),
-    # Убраны ВСЕ операции обрезки (Crop)
-    # Добавлено только масштабирование при необходимости
-    A.Resize(100, 100, always_apply=True)  # Гарантируем размер 100x100
-])
-
-val_transform = A.Compose([
-    A.Resize(100, 100, always_apply=True)  # Только ресайз для валидации
-])
-
-
-# 7. Исправленный класс Dataset с безопасной обработкой изображений
-class SatelliteDataset(Dataset):
-    def __init__(self, root_dir, classes, transform=None, mode='train'):
-        self.samples = []
-        self.transform = transform
+# 5. Модель
+class SegModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = smp.Unet(
+            encoder_name="resnet34",
+            encoder_weights="imagenet",
+            classes=NUM_CLASSES,
+            activation='softmax'
+        )
         
-        # Собираем все доступные изображения
-        for class_name, color in classes.items():
-            class_dir = os.path.join(root_dir, class_name)
-            if not os.path.exists(class_dir):
-                print(f"⚠️ Папка {class_name} не найдена, пропускаем")
-                continue
-                
-            # Получаем все поддерживаемые изображения
-            valid_extensions = ('.tif', '.tiff', '.png', '.jpg', '.jpeg')
-            files = [f for f in os.listdir(class_dir) 
-                    if f.lower().endswith(valid_extensions)]
-            
-            if not files:
-                print(f"⚠️ В папке {class_name} нет подходящих изображений")
-                continue
-                
-            # Разделение на train/val
-            train_files, val_files = train_test_split(files, test_size=0.2, random_state=42)
-            
-            for f in (train_files if mode == 'train' else val_files):
-                self.samples.append((
-                    os.path.join(class_dir, f),
-                    color
-                ))
-        
-        if not self.samples:
-            raise ValueError(f"Не найдено изображений для {mode}")
+    def forward(self, x):
+        return self.model(x)
 
-    def __len__(self):
-        return len(self.samples)
+# 6. Веса классов
+def get_class_weights(mask):
+    present_classes = np.unique(mask)
+    weights = compute_class_weight(
+        'balanced',
+        classes=present_classes,
+        y=mask.flatten()
+    )
+    weight_dict = {cls: weight for cls, weight in zip(present_classes, weights)}
+    return torch.tensor([weight_dict.get(i, 1.0) for i in range(NUM_CLASSES)]).float().to(DEVICE)
 
-    def __getitem__(self, idx):
-        img_path, color = self.samples[idx]
-        
-        try:
-            # Чтение с обработкой ошибок
-            img = read_image(img_path)
-            if img is None:
-                raise ValueError(f"Не удалось прочитать {img_path}")
-                
-            # Нормализация
-            if img.dtype == np.uint16:
-                img = (img / 256).astype(np.uint8)
-            if len(img.shape) == 2:
-                img = np.stack([img]*3, axis=-1)
-            img = img[:,:,:3]
-            
-            # Гарантированный ресайз
-            if img.shape[0] != 100 or img.shape[1] != 100:
-                img = cv2.resize(img, (100, 100), interpolation=cv2.INTER_AREA)
-            
-            # Создание маски
-            mask = np.zeros_like(img)
-            mask[:] = color
-            
-            # Безопасное применение аугментаций
-            if self.transform:
-                try:
-                    augmented = self.transform(image=img, mask=mask)
-                    img, mask = augmented['image'], augmented['mask']
-                except Exception as e:
-                    print(f"⚠️ Ошибка аугментации (файл: {os.path.basename(img_path)}): {str(e)}")
-                    # Возвращаем оригиналы если аугментация не удалась
-            
-            return transforms.ToTensor()(img), transforms.ToTensor()(mask)
-            
-        except Exception as e:
-            print(f"⚠️ Критическая ошибка (файл: {os.path.basename(img_path)}): {str(e)}")
-            # Возвращаем нули если совсем ничего не работает
-            dummy_img = torch.zeros(3, 100, 100)
-            dummy_mask = torch.zeros(3, 100, 100)
-            return dummy_img, dummy_mask
-# 8. Улучшенная функция визуализации со случайной выборкой
-def show_samples(dataset, title, num_samples=3, random_seed=None):
-    """
-    Визуализирует случайные примеры из датасета
-    
-    Параметры:
-        dataset: Датасет для визуализации
-        title: Заголовок для отображения
-        num_samples: Количество примеров (по умолчанию 3)
-        random_seed: Фиксированный seed для воспроизводимости (None для случайных)
-    """
-    plt.figure(figsize=(10, 5))
-    
-    # Создаем временный датасет без аугментаций
-    from copy import deepcopy
-    vis_dataset = deepcopy(dataset)
-    vis_dataset.transform = None  # Отключаем аугментации
-    
-    # Проверяем доступное количество примеров
-    num_samples = min(num_samples, len(vis_dataset))
-    if num_samples <= 0:
-        print("⚠️ Нет доступных примеров для визуализации")
-        return
-    
-    # Выбираем случайные индексы
-    if random_seed is not None:
-        np.random.seed(random_seed)
-    random_indices = np.random.choice(len(vis_dataset), num_samples, replace=False)
-    
-    for i, idx in enumerate(random_indices):
-        try:
-            img, mask = vis_dataset[idx]
-            
-            # Визуализация изображения
-            plt.subplot(2, num_samples, i+1)
-            plt.imshow(img.permute(1, 2, 0))
-            plt.title(f"{title} {i+1}\n{os.path.basename(dataset.samples[idx][0])}")
-            plt.axis('off')
-            
-            # Визуализация маски
-            plt.subplot(2, num_samples, i+1+num_samples)
-            plt.imshow(mask.permute(1, 2, 0))
-            plt.title(f"Маска {i+1}")
-            plt.axis('off')
-            
-        except Exception as e:
-            print(f"Ошибка визуализации примера {idx}: {str(e)}")
-            continue
-    
-    plt.tight_layout()
-    plt.show()
-    plt.close()  # Закрываем фигуру чтобы не накапливались в памяти
+# 7. Функция IoU
+def calculate_iou(preds, targets):
+    smooth = 1e-6
+    preds = torch.argmax(preds, dim=1)
+    intersection = (preds == targets).float().sum()
+    union = (preds != 0).float().sum() + (targets != 0).float().sum() - intersection
+    return (intersection + smooth) / (union + smooth)
 
-kol=5
-print("\n5 случайных примеров:")
-show_samples(train_dataset, "Train", num_samples=kol)
-print("\n5 случайных примеров:")
-show_samples(val_dataset, "Validation", num_samples=kol)
-
-# 9. Функция обучения с новыми метриками
-def train_and_evaluate():
-    # Создаем датасеты
-    train_dataset = SatelliteDataset(DATA_ROOT, CLASSES, train_transform, 'train')
-    val_dataset = SatelliteDataset(DATA_ROOT, CLASSES, val_transform, 'val')
+# 8. Обучение с прогресс-баром
+def train(num_epochs=20):
+    dataset = SatelliteDataset(IMAGE_PATH, ANNOTATION_PATH, get_transform())
+    loader = DataLoader(dataset, batch_size=4, shuffle=True)
     
-    # Даталоадеры
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=8)
+    model = SegModel().to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
-    # Инициализация модели
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = smp.Unet(
-        'resnet34',
-        encoder_weights='imagenet',
-        classes=3,
-        activation='sigmoid'
-    ).to(device)
+    weights = get_class_weights(dataset.masks)
+    criterion = nn.CrossEntropyLoss(weight=weights)
     
-    # Оптимизатор и функция потерь
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.BCEWithLogitsLoss()
+    train_loss = []
+    train_iou = []
+    best_iou = 0.0
     
-    # Для отслеживания метрик
-    train_loss_history = []
-    val_loss_history = []
-    train_iou_history = []
-    val_iou_history = []
-    
-    # Функция для вычисления IoU
-    def calculate_iou(preds, targets):
-        # Применяем сигмоиду и порог
-        preds = (torch.sigmoid(preds) > 0.5).float()
-        # Вычисляем пересечение и объединение
-        intersection = (preds * targets).sum()
-        union = (preds + targets).sum() - intersection
-        # Избегаем деления на ноль
-        iou = (intersection + 1e-6) / (union + 1e-6)
-        return iou.item()
-    
-    # Обучение
-    num_epochs = 10
-    best_val_loss = float('inf')
-    
-    for epoch in range(num_epochs):
+    # Обучение с прогресс-баром
+    epoch_pbar = tqdm(range(num_epochs), desc='Обучение', unit='epoch')
+    for epoch in epoch_pbar:
         model.train()
-        epoch_train_loss = 0.0
-        epoch_train_iou = 0.0
+        epoch_loss = 0
+        epoch_iou = 0
         
-        # Прогресс-бар для обучения
-        train_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
-        for images, masks in train_bar:
-            images, masks = images.to(device), masks.to(device)
+        batch_pbar = tqdm(loader, desc=f'Эпоха {epoch+1}', leave=False)
+        for images, masks in batch_pbar:
+            images, masks = images.to(DEVICE), masks.to(DEVICE)
             
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, masks)
+            loss = criterion(outputs, masks.long())
             loss.backward()
             optimizer.step()
             
-            # Вычисляем IoU
-            iou = calculate_iou(outputs, masks)
+            with torch.no_grad():
+                batch_iou = calculate_iou(outputs, masks)
+                epoch_loss += loss.item()
+                epoch_iou += batch_iou
             
-            epoch_train_loss += loss.item()
-            epoch_train_iou += iou
-            
-            train_bar.set_postfix({
-                'loss': loss.item(),
-                'iou': iou
+            batch_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'IoU': f'{batch_iou:.4f}'
             })
         
-        # Валидация
-        model.eval()
-        epoch_val_loss = 0.0
-        epoch_val_iou = 0.0
+        epoch_loss /= len(loader)
+        epoch_iou /= len(loader)
+        train_loss.append(epoch_loss)
+        train_iou.append(epoch_iou)
         
-        with torch.no_grad():
-            val_bar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
-            for images, masks in val_bar:
-                images, masks = images.to(device), masks.to(device)
-                outputs = model(images)
-                
-                loss = criterion(outputs, masks)
-                iou = calculate_iou(outputs, masks)
-                
-                epoch_val_loss += loss.item()
-                epoch_val_iou += iou
-                
-                val_bar.set_postfix({
-                    'loss': loss.item(),
-                    'iou': iou
-                })
-        
-        # Сохраняем метрики
-        train_loss_history.append(epoch_train_loss / len(train_loader))
-        val_loss_history.append(epoch_val_loss / len(val_loader))
-        train_iou_history.append(epoch_train_iou / len(train_loader))
-        val_iou_history.append(epoch_val_iou / len(val_loader))
-        
-        # Сохраняем лучшую модель
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
-            model_path = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/best_model.pth'
-            torch.save(model.state_dict(), model_path)
-            print(f"\nSaved best model to {model_path}")
+        if epoch_iou > best_iou:
+            best_iou = epoch_iou
+            torch.save(model.state_dict(), os.path.join(SAVE_DIR, 'best_model.pth'))
+            epoch_pbar.set_postfix({'Best IoU': f'{best_iou:.4f}'})
     
-    # Визуализация метрик
+    torch.save(model.state_dict(), os.path.join(SAVE_DIR, 'final_model.pth'))
+    
+    # Графики
     plt.figure(figsize=(12, 5))
-    
-    # График потерь
     plt.subplot(1, 2, 1)
-    plt.plot(train_loss_history, label='Train Loss')
-    plt.plot(val_loss_history, label='Validation Loss')
-    plt.title('Training and Validation Loss')
+    plt.plot(train_loss, 'r-', label='Loss')
+    plt.title('Training Loss')
     plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
+    plt.grid(True)
     
-    # График IoU (Accuracy)
     plt.subplot(1, 2, 2)
-    plt.plot(train_iou_history, label='Train IoU')
-    plt.plot(val_iou_history, label='Validation IoU')
-    plt.title('Training and Validation IoU')
+    plt.plot(train_iou, 'g-', label='IoU')
+    plt.title('Training IoU')
     plt.xlabel('Epoch')
-    plt.ylabel('IoU Score')
-    plt.legend()
+    plt.grid(True)
     
     plt.tight_layout()
-    
-    # Сохраняем графики
-    plots_dir = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/training_plots'
-    os.makedirs(plots_dir, exist_ok=True)
-    plt.savefig(os.path.join(plots_dir, 'training_metrics.png'))
+    plt.savefig(os.path.join(SAVE_DIR, 'training_metrics.png'), dpi=300)
     plt.show()
-    plt.close()
     
-    # Визуализация примеров после обучения
-    visualize_predictions(model, val_dataset, device)
+    return model
 
-# 10. Функция для визуализации предсказаний (оставляем без изменений)
-def visualize_predictions(model, dataset, device, num_samples=3):
+# 9. Визуализация предсказаний
+def predict_and_visualize(model, image_path):
     model.eval()
-    indices = np.random.choice(len(dataset), num_samples)
+    image = np.array(Image.open(image_path).convert('RGB'))
+    h, w = image.shape[:2]
     
-    plt.figure(figsize=(15, 5 * num_samples))
+    transform = A.Compose([
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2()
+    ])
     
-    for i, idx in enumerate(indices):
-        # Получаем данные
-        image, true_mask = dataset[idx]
-        image = image.unsqueeze(0).to(device)
-        
-        # Делаем предсказание
-        with torch.no_grad():
-            pred_mask = model(image).sigmoid().squeeze().cpu()
-        
-        # Преобразуем в numpy
-        image_np = image.squeeze().cpu().permute(1, 2, 0).numpy()
-        true_mask_np = true_mask.permute(1, 2, 0).numpy()
-        pred_mask_np = (pred_mask > 0.5).float().permute(1, 2, 0).numpy()
-        
-        # Оригинальное изображение
-        plt.subplot(num_samples, 3, i*3 + 1)
-        plt.imshow(image_np)
-        plt.title(f"Пример {i+1}\nОригинал")
-        plt.axis('off')
-        
-        # Истинная маска
-        plt.subplot(num_samples, 3, i*3 + 2)
-        plt.imshow(true_mask_np)
-        plt.title("Истинная маска")
-        plt.axis('off')
-        
-        # Предсказанная маска
-        plt.subplot(num_samples, 3, i*3 + 3)
-        plt.imshow(pred_mask_np)
-        plt.title("Предсказание")
-        plt.axis('off')
+    full_mask = np.zeros((h, w), dtype=np.uint8)
+    tile_size = 512
+    
+    with tqdm(total=(h//tile_size)*(w//tile_size), desc='Обработка изображения') as pbar:
+        for y in range(0, h, tile_size):
+            for x in range(0, w, tile_size):
+                tile = image[y:y+tile_size, x:x+tile_size]
+                if tile.size == 0:
+                    continue
+                    
+                transformed = transform(image=tile)
+                tile_tensor = transformed['image'].unsqueeze(0).to(DEVICE)
+                
+                with torch.no_grad():
+                    output = model(tile_tensor)
+                    pred = torch.argmax(output, dim=1).cpu().numpy()[0]
+                
+                full_mask[y:y+tile.shape[0], x:x+tile.shape[1]] = pred
+                pbar.update(1)
+    
+    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+    for class_id, color in CLASS_COLORS.items():
+        color_mask[full_mask == class_id] = color
+    
+    plt.figure(figsize=(18, 6))
+    plt.subplot(1, 3, 1)
+    plt.imshow(image)
+    plt.title('Исходное изображение')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 2)
+    plt.imshow(color_mask)
+    plt.title('Предсказанная маска')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 3)
+    plt.imshow(image)
+    plt.imshow(color_mask, alpha=0.5)
+    plt.title('Наложение маски')
+    plt.axis('off')
+    
+    patches = [mpatches.Patch(color=np.array(color)/255, label=CLASSES[class_id]) 
+               for class_id, color in CLASS_COLORS.items()]
+    plt.legend(handles=patches, bbox_to_anchor=(1.05, 1), loc='upper left')
     
     plt.tight_layout()
-    
-    # Сохраняем визуализацию
-    preds_dir = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/predictions'
-    os.makedirs(preds_dir, exist_ok=True)
-    plt.savefig(os.path.join(preds_dir, 'model_predictions.png'))
     plt.show()
-    plt.close()
 
-# Запуск обучения
+
+# 10. Запуск
 if __name__ == "__main__":
-    train_and_evaluate()
+    print("Начало обучения...")
+    NUM_EPOCHS = 30 # Можно изменить
+    trained_model = train(num_epochs=NUM_EPOCHS)
+    
+    print("\nТестирование модели:")
+    TEST_IMAGE = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/supervisely/full_area_02.png'
+    predict_and_visualize(trained_model, TEST_IMAGE)
