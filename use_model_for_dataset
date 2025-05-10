@@ -1,0 +1,242 @@
+!pip install segmentation_models_pytorch
+import os
+import json
+import numpy as np
+import torch
+import segmentation_models_pytorch as smp
+from PIL import Image
+from tqdm.notebook import tqdm
+from pycocotools import mask as maskUtils
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from google.colab import drive
+# 1. Инициализация и настройка путей
+drive.mount('/content/drive')
+
+# Конфигурация классов
+CLASSES = {
+    0: 'background',
+    1: 'forest',
+    2: 'field',
+    3: 'city',
+    4: 'water'
+}
+
+CLASS_COLORS = {
+    1: [0, 255, 0],    # Зеленый - лес
+    2: [255, 255, 0],  # Желтый - поле
+    3: [255, 0, 0],    # Красный - город
+    4: [0, 0, 255]     # Синий - вода
+}
+
+# Пути
+BASE_DATASET_PATH = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/Полный архив/'
+CONVERTED_PATH = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/Конвертированный датасет/'
+AUTO_ANNOTATED_PATH = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/Авторазметка датасета/'
+MODEL_PATH = '/content/drive/MyDrive/Цифровая кафедра/Сигментация/supervisely/models/best_model.pth'
+# 2. Функция конвертации TIFF в PNG
+def convert_tiff_to_png(input_path, output_path):
+    """Конвертирует все TIFF изображения в PNG, сохраняя структуру папок"""
+    os.makedirs(output_path, exist_ok=True)
+    
+    # Собираем все TIFF файлы
+    tiff_files = []
+    for root, _, files in os.walk(input_path):
+        for file in files:
+            if file.lower().endswith('.tif') or file.lower().endswith('.tiff'):
+                tiff_files.append(os.path.join(root, file))
+    
+    if not tiff_files:
+        print("Не найдено TIFF файлов для конвертации!")
+        return
+    
+    # Конвертируем каждый файл
+    for tiff_path in tqdm(tiff_files, desc="Конвертация TIFF в PNG"):
+        try:
+            # Сохраняем структуру папок
+            rel_path = os.path.relpath(tiff_path, input_path)
+            png_path = os.path.join(output_path, os.path.splitext(rel_path)[0] + '.png')
+            os.makedirs(os.path.dirname(png_path), exist_ok=True)
+            
+            # Конвертируем и сохраняем как PNG
+            with Image.open(tiff_path) as img:
+                img.save(png_path, 'PNG')
+                
+        except Exception as e:
+            print(f"Ошибка при конвертации {tiff_path}: {str(e)}")
+    
+    print(f"\nКонвертация завершена! Результаты сохранены в: {output_path}")
+
+# 3. Загрузка модели
+def load_segmentation_model():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    class SegModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = smp.Unet(
+                encoder_name="resnet34",
+                encoder_weights=None,
+                classes=len(CLASSES),
+                activation='softmax'
+            )
+            
+        def forward(self, x):
+            return self.model(x)
+    
+    model = SegModel().to(device)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.eval()
+    return model, device
+
+# 4. Функции для обработки изображений
+def mask_to_coco(image_path, pred_mask):
+    h, w = pred_mask.shape
+    image_name = os.path.basename(image_path)
+    image_id = os.path.splitext(image_name)[0]
+    
+    coco_output = {
+        "description": "Auto-generated annotations",
+        "tags": [],
+        "size": {
+            "height": h,
+            "width": w
+        },
+        "objects": []
+    }
+    
+    for class_id in np.unique(pred_mask):
+        if class_id == 0:  # Пропускаем фон
+            continue
+            
+        class_mask = (pred_mask == class_id).astype(np.uint8)
+        rle = maskUtils.encode(np.asfortranarray(class_mask))
+        
+        coco_output["objects"].append({
+            "classTitle": CLASSES[class_id],
+            "description": "",
+            "geometryType": "bitmap",
+            "labelerLogin": "auto",
+            "createdAt": "2023-01-01T00:00:00.000Z",
+            "updatedAt": "2023-01-01T00:00:00.000Z",
+            "tags": [],
+            "bitmap": {
+                "data": rle['counts'].decode('utf-8'),
+                "origin": [0, 0]
+            }
+        })
+    
+    return coco_output
+
+def process_image(img_path, output_dir, transform, tile_size=512):
+    try:
+        img = np.array(Image.open(img_path).convert('RGB'))
+        h, w = img.shape[:2]
+        full_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        # Обработка по тайлам
+        for y in range(0, h, tile_size):
+            for x in range(0, w, tile_size):
+                tile = img[y:y+tile_size, x:x+tile_size]
+                if tile.size == 0:
+                    continue
+                    
+                tensor = transform(image=tile)['image'].unsqueeze(0).to(device)
+                with torch.no_grad():
+                    pred = torch.argmax(model(tensor), dim=1).cpu().numpy()[0]
+                    full_mask[y:y+tile.shape[0], x:x+tile.shape[1]] = pred
+        
+        # Сохранение результатов
+        rel_path = os.path.relpath(img_path, CONVERTED_PATH)
+        
+        # 1. Сохраняем изображение
+        output_img_path = os.path.join(output_dir, 'img', rel_path)
+        os.makedirs(os.path.dirname(output_img_path), exist_ok=True)
+        Image.fromarray(img).save(output_img_path)
+        
+        # 2. Сохраняем аннотацию
+        coco_ann = mask_to_coco(output_img_path, full_mask)
+        ann_path = os.path.join(output_dir, 'ann', 
+                              os.path.splitext(rel_path)[0] + '.json')
+        os.makedirs(os.path.dirname(ann_path), exist_ok=True)
+        
+        with open(ann_path, 'w') as f:
+            json.dump(coco_ann, f, indent=2)
+            
+        return True
+    
+    except Exception as e:
+        print(f"Ошибка при обработке {img_path}: {str(e)}")
+        return False
+
+# 5. Создание meta.json
+def create_meta_file(output_path):
+    meta = {
+        "classes": [
+            {
+                "title": CLASSES[class_id],
+                "shape": "bitmap",
+                "color": "#{:02x}{:02x}{:02x}".format(*CLASS_COLORS[class_id])
+            }
+            for class_id in CLASSES if class_id != 0
+        ],
+        "tags": []
+    }
+    
+    with open(os.path.join(output_path, 'meta.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
+
+# 6. Основной пайплайн
+def main():
+    # Шаг 1: Конвертация TIFF в PNG
+    print("Этап 1: Конвертация TIFF в PNG...")
+    convert_tiff_to_png(BASE_DATASET_PATH, CONVERTED_PATH)
+    
+    # Шаг 2: Загрузка модели
+    print("\nЭтап 2: Загрузка модели сегментации...")
+    global model, device
+    model, device = load_segmentation_model()
+    
+    # Шаг 3: Подготовка папок для авторазметки
+    os.makedirs(os.path.join(AUTO_ANNOTATED_PATH, 'img'), exist_ok=True)
+    os.makedirs(os.path.join(AUTO_ANNOTATED_PATH, 'ann'), exist_ok=True)
+    create_meta_file(AUTO_ANNOTATED_PATH)
+# Запуск
+if __name__ == "__main__":
+    main()
+    
+    # Шаг 4: Настройка преобразований
+    transform = A.Compose([
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2()
+    ])
+    
+    # Шаг 5: Собираем все PNG изображения
+    print("\nЭтап 3: Поиск изображений для обработки...")
+    image_paths = []
+    for root, _, files in os.walk(CONVERTED_PATH):
+        for file in files:
+            if file.lower().endswith('.png'):
+                image_paths.append(os.path.join(root, file))
+    
+    if not image_paths:
+        print("Не найдено PNG файлов для обработки!")
+        return
+    
+    # Шаг 6: Обработка изображений
+    print(f"\nЭтап 4: Автоматическая разметка ({len(image_paths)} изображений)...")
+    success_count = 0
+    for img_path in tqdm(image_paths, desc="Обработка изображений"):
+        if process_image(img_path, AUTO_ANNOTATED_PATH, transform):
+            success_count += 1
+    
+    # Итоги
+    print(f"\nГотово! Успешно обработано {success_count}/{len(image_paths)} изображений.")
+    print(f"Исходные TIFF файлы остались нетронутыми в: {BASE_DATASET_PATH}")
+    print(f"Конвертированные PNG файлы сохранены в: {CONVERTED_PATH}")
+    print(f"Результаты автоматической разметки сохранены в: {AUTO_ANNOTATED_PATH}")
+    
+    print("\nДля загрузки в Supervisely:")
+    print("1. Создайте новый проект")
+    print("2. Выберите 'Import' → 'Supervisely format'")
+    print("3. Загрузите всю папку 'Авторазметка датасета'")
